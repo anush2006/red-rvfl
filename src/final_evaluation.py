@@ -2,16 +2,13 @@ import os
 import numpy as np
 import pandas as pd
 
-from src.run.data_loader import load_dataset, create_dataset, split_data
+from src.run.data_loader import load_dataset, create_dataset
 from src.run.model_runner import train_model, predict
 from src.run.evaluator import inverse_scale, evaluate
 
 
-# -------------------------------
-# PATHS
-# -------------------------------
 DATASET_FOLDER = "./RVFL_Datasets"
-TOP_CONFIG_PATH = "top_10_configs.csv"
+RESULTS_PATH = "results_mean.csv"   # from 70/10/20 phase
 
 
 datasets = [
@@ -21,95 +18,136 @@ datasets = [
 ]
 
 
-def scale_with_params(data, x_min, x_max, scaling):
-    scaled = (data - x_min) / (x_max - x_min + 1e-8)
-    scaled = scaled * scaling
-    return scaled
+def scale(data, x_min, x_max, scaling):
+    return ((data - x_min) / (x_max - x_min + 1e-8)) * scaling
 
 
+# -------------------------------
+# LOAD RESULTS (70/10/20)
+# -------------------------------
+df = pd.read_csv(RESULTS_PATH)
 
-configs_df = pd.read_csv(TOP_CONFIG_PATH)
+df.columns = [
+    "Config ID", "Dataset",
+    "Window", "K",
+    "Hidden Size", "Num Layers",
+    "Ridge Alpha", "Input Scaling",
+    "RMSE", "MAE", "MAPE", "Time"
+]
 
+
+# -------------------------------
+# DATASET-WISE BEST CONFIG
+# -------------------------------
+best_per_dataset = (
+    df.sort_values("RMSE")
+      .groupby("Dataset")
+      .first()
+      .reset_index()
+)
+
+print("\nBest config per dataset:")
+print(best_per_dataset[["Dataset", "Config ID", "RMSE"]])
+
+
+# -------------------------------
+# FINAL 80/20 EVALUATION
+# -------------------------------
 results = []
 
-for _, config in configs_df.iterrows():
+for _, row in best_per_dataset.iterrows():
 
-    print(f"\nRunning FINAL config {config['Config ID']}")
+    dataset = row["Dataset"]
 
     cfg = {
-        "window": int(config["Window"]),
-        "k": int(config["K"]),
-        "hidden_size": int(config["Hidden Size"]),
-        "num_layers": int(config["Num Layers"]),
-        "ridge_alpha": float(config["Ridge Alpha"]),
-        "input_scaling": float(config["Input Scaling"])
+        "window": int(row["Window"]),
+        "k": int(row["K"]),
+        "hidden_size": int(row["Hidden Size"]),
+        "num_layers": int(row["Num Layers"]),
+        "ridge_alpha": float(row["Ridge Alpha"]),
+        "input_scaling": float(row["Input Scaling"])
     }
 
-    for file in datasets:
+    print(f"\nRunning {dataset} with Config {int(row['Config ID'])}")
 
-        path = os.path.join(DATASET_FOLDER, file)
-        prices = load_dataset(path)
+    # -------------------------------
+    # LOAD DATA
+    # -------------------------------
+    path = os.path.join(DATASET_FOLDER, dataset)
+    prices = load_dataset(path).reshape(-1, 1)
 
-        # store original min/max for inverse scaling
-        global_min, global_max = prices.min(), prices.max()
+    n = len(prices)
+    split = int(n * 0.8)
 
-        # ❗ create dataset FIRST (no scaling yet)
-        X, y = create_dataset(prices.reshape(-1, 1), cfg["window"], cfg["k"])
-
-        # ❗ split BEFORE scaling
-        X_train, y_train, X_val, y_val, X_test, y_test = split_data(X, y)
-
-        # ❗ compute scaling from TRAIN ONLY
-        x_min = X_train.min()
-        x_max = X_train.max()
-
-        # scale all splits consistently
-        X_train = scale_with_params(X_train, x_min, x_max, cfg["input_scaling"])
-        X_val   = scale_with_params(X_val, x_min, x_max, cfg["input_scaling"])
-        X_test  = scale_with_params(X_test, x_min, x_max, cfg["input_scaling"])
-
-        y_train = scale_with_params(y_train, x_min, x_max, cfg["input_scaling"])
-        y_val   = scale_with_params(y_val, x_min, x_max, cfg["input_scaling"])
-        y_test  = scale_with_params(y_test, x_min, x_max, cfg["input_scaling"])
-
-        # combine train + val for final training (correct protocol)
-        X_full = np.concatenate([X_train, X_val])
-        y_full = np.concatenate([y_train, y_val])
-
-        # train
-        model, ridge_models = train_model(X_full, y_full, cfg)
-
-        # test
-        pred = predict(model, ridge_models, X_test, cfg)
-
-        # inverse scaling to original price space
-        y_test_orig = inverse_scale(y_test, cfg["input_scaling"], x_min, x_max).flatten()
-        pred_orig   = inverse_scale(pred, cfg["input_scaling"], x_min, x_max)
-
-        # metrics
-        rmse, mae, mape = evaluate(y_test_orig, pred_orig)
-
-        print(f"{file} | RMSE: {rmse:.3f}")
-
-        results.append([
-            int(config["Config ID"]),
-            file,
-            cfg["window"], cfg["k"],
-            cfg["hidden_size"], cfg["num_layers"],
-            cfg["ridge_alpha"], cfg["input_scaling"],
-            rmse, mae, mape
-        ])
+    train_prices = prices[:split]
+    test_prices  = prices[split:]
 
 
+    # -------------------------------
+    # SCALE (TRAIN ONLY)
+    # -------------------------------
+    x_min = train_prices.min()
+    x_max = train_prices.max()
+
+    train_scaled = scale(train_prices, x_min, x_max, cfg["input_scaling"])
+    test_scaled  = scale(test_prices,  x_min, x_max, cfg["input_scaling"])
+
+
+    # -------------------------------
+    # CREATE WINDOWS
+    # -------------------------------
+    X_train, y_train = create_dataset(train_scaled, cfg["window"], cfg["k"])
+    X_test,  y_test  = create_dataset(test_scaled,  cfg["window"], cfg["k"])
+
+
+    # -------------------------------
+    # TRAIN
+    # -------------------------------
+    model, ridge_models = train_model(X_train, y_train, cfg)
+
+
+    # -------------------------------
+    # TEST
+    # -------------------------------
+    pred = predict(model, ridge_models, X_test, cfg)
+
+
+    # -------------------------------
+    # INVERSE SCALE
+    # -------------------------------
+    y_test_orig = inverse_scale(y_test, cfg["input_scaling"], x_min, x_max).flatten()
+    pred_orig   = inverse_scale(pred, cfg["input_scaling"], x_min, x_max)
+
+
+    # -------------------------------
+    # METRICS
+    # -------------------------------
+    rmse, mae, mape = evaluate(y_test_orig, pred_orig)
+
+    print(f"{dataset} | RMSE: {rmse:.3f}")
+
+    results.append([
+        dataset,
+        int(row["Config ID"]),
+        cfg["window"], cfg["k"],
+        cfg["hidden_size"], cfg["num_layers"],
+        cfg["ridge_alpha"], cfg["input_scaling"],
+        rmse, mae, mape
+    ])
+
+
+# -------------------------------
+# SAVE FINAL RESULTS
+# -------------------------------
 columns = [
-    "Config ID", "Dataset",
+    "Dataset", "Config ID",
     "Window", "K",
     "Hidden", "Layers",
     "Ridge", "Scaling",
     "RMSE", "MAE", "MAPE"
 ]
 
-df = pd.DataFrame(results, columns=columns)
-df.to_csv("final_results.csv", index=False)
+final_df = pd.DataFrame(results, columns=columns)
+final_df.to_csv("final_results_datasetwise.csv", index=False)
 
-print("\nFinal evaluation complete → saved as final_results.csv")
+print("\nSaved → final_results_datasetwise.csv")
