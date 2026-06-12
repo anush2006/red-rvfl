@@ -3,8 +3,12 @@ numpy
 scikit-learn
 optuna
 pandas
-yfinance
 statsmodels
 openpyxl
 matplotlib
+<<<<<<< HEAD
+vmdpy
+ewtpy
+=======
 seaborn
+>>>>>>> cc49257403b50856bc14abaf963ee5b72c1822ab

@@ -27,11 +27,18 @@ data/
 
 # model outputs
 models/
-
+.gitignore
+*.pyc
 <<<<<<< HEAD
 RVFL_Datasets/
 =======
 *.zip
 
 results_partial.csv
->>>>>>> f8d5160d4c34a0467e53ac542f27dd301dbd74d2
+
+
+cleanenv/
+venv/
+__pycache__/
+*.pyc
+.env

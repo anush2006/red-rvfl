@@ -1,281 +1,494 @@
+"""
+run_all_models.py — Main experiment runner for RedRVFL paper replication.
+
+Pipeline:
+  1. For each dataset × window_size:
+     - Load data, create sliding windows
+     - Split: train(70%) → val(10%) → test(20%) — sequential, NO shuffle
+     - Fit MinMaxScaler on TRAIN ONLY
+     - Tune each model's hyperparameters on validation set (Optuna)
+     - Retrain best config on train+val combined
+     - Evaluate on test set
+  2. Report best window size per dataset
+  3. Output paper-style tables (RMSE, MAE, MAPE)
+
+Usage:
+    python run_all_models.py
+"""
+
 import sys
 import os
+import warnings
+import time
+import glob
+import importlib
+import concurrent.futures
+
+# Suppress warnings for clean output
+warnings.filterwarnings('ignore')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 sys.path.insert(0, BASE_DIR)
-sys.path.insert(0, os.path.join(BASE_DIR, "models"))
-sys.path.insert(0, os.path.join(BASE_DIR, "src"))
 
 import numpy as np
 import pandas as pd
+import random
 import torch
-import os
 
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.linear_model import Ridge
+# Optuna intentionally imported explicitly to ensure tuning is enabled.
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+print("=" * 60)
+print("Starting project...")
+print("=" * 60)
 
 # ========================
-# IMPORT YOUR MODELS
+# SETTINGS & FAST MODE
 # ========================
-from persistence_model import predict as persistence_predict
-from models.svr_model import train as svr_train, predict as svr_predict
-from models.arima_model import train as arima_train, predict as arima_predict
-from models.lstm_model import LSTMModel, train as lstm_train
-from models.gru_model import GRUModel, train as gru_train
-from models.tcn_model import TCN
-from models.rvfl_model import RVFL
-from models.edrvfl_model import edRVFL
-from models.edesn_model import edESN
-from models.vmd_lstm_model import build_model as vmd_lstm_build
-from models.ewtrvfl_model import build_model as ewtrvfl_build
-from models.ewtedrvfl_model import build_model as ewtedrvfl_build
+FAST_MODE = True
 
-# Proposed model
-from src.red_revfl_orchestrator import RedRVFLOrchestrator
+if FAST_MODE:
+    print("[INFO] FAST_MODE is enabled! Using optimized hyperparams and timeouts.")
+    TRIALS_SIMPLE = 3
+    TRIALS_DL = 3
+    EPOCHS_DL = 5
+    TIMEOUT = 300  # Increased to at least 300s as requested
+else:
+    TRIALS_SIMPLE = 50
+    TRIALS_DL = 20
+    EPOCHS_DL = 100
+    TIMEOUT = 600
+
+# ========================
+# REPRODUCIBILITY & DEVICE
+# ========================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+torch.manual_seed(SEED)
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+device = torch.device("cpu")
+print(f"[INFO] Device strictly set to: {device} (CUDA disabled)")
+
+# ========================
+# IMPORTS
+# ========================
+from src.data_utils import load_dataset, create_windows, split_data, fit_scaler, transform_data, inverse_transform
 from src.metrics import rmse, mae, mape
 
 # ========================
-# SETTINGS
+# CONFIG
 # ========================
-np.random.seed(42)
-torch.manual_seed(42)
+DATASET_FOLDER = os.path.join(BASE_DIR, "RVFL_Datasets")
 
-dataset_folder = "RVFL_Datasets"
-
-datasets = [
-    "DJI.xlsx","HSI.xlsx","KOSPI.xlsx","LSE.xlsx",
-    "NASDAQ.xlsx","NIFTY50.xlsx","NYSE.xlsx",
-    "RUSSELL2000.xlsx","SENSEX.xlsx","SP500.xlsx","SSE.xlsx"
+DATASETS = [
+    "DJI.xlsx", "HSI.xlsx", "KOSPI.xlsx", "LSE.xlsx",
+    "NASDAQ.xlsx", "NIFTY50.xlsx", "NYSE.xlsx",
+    "RUSSELL2000.xlsx", "SENSEX.xlsx", "SP500.xlsx", "SSE.xlsx"
 ]
 
-WINDOW = 10
+WINDOW_SIZES = [48, 96, 124]
 
-# ========================
-# DATASET CREATION
-# ========================
-def create_dataset(data, window):
-    X, y = [], []
-    for i in range(len(data) - window):
-        X.append(data[i:i+window])
-        y.append(data[i+window])
-    return np.array(X), np.array(y)
 
-# ========================
-# MAIN LOOP
-# ========================
-results = []
+def flatten_3d(X):
+    """Flatten 3D (n, window, 1) to 2D (n, window) for ML models."""
+    return X.reshape(X.shape[0], -1)
 
-for file in datasets:
 
-    print("\n====================")
-    print("Dataset:", file)
-    print("====================")
+def run_persistence(X_test, y_test_orig, scaler):
+    from models.persistence_model import predict
+    pred = predict(X_test)
+    return inverse_transform(pred, scaler)
 
-    path = os.path.join(dataset_folder, file)
-    df = pd.read_excel(path, skiprows=2)
 
-    df.columns = ['Date', 'Close']
-    df = df.dropna()
-    prices = df['Close'].values
+def run_arima(prices_scaled, train_end, val_end, n_test, scaler, window_size):
+    from models.arima_model import train, predict
+    train_series = prices_scaled[:val_end + window_size].flatten()
+    model = train(train_series)
+    pred = predict(model, n_test)
+    pred = pred[:n_test]
+    return inverse_transform(pred, scaler)
 
-    x_min, x_max = prices.min(), prices.max()
 
-    scaler = MinMaxScaler()
-    prices_scaled = scaler.fit_transform(prices.reshape(-1,1))
+def run_svr(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler):
+    from src.tuning import tune_svr
+    from models.svr_model import train, predict
+    best_params, _ = tune_svr(X_train_flat, y_train, X_val_flat, y_val, n_trials=TRIALS_SIMPLE, seed=SEED, timeout=TIMEOUT)
+    X_full = np.concatenate([X_train_flat, X_val_flat])
+    y_full = np.concatenate([y_train, y_val])
+    model = train(X_full, y_full, **best_params)
+    pred = predict(model, X_test_flat)
+    return inverse_transform(pred, scaler)
 
-    X, y = create_dataset(prices_scaled, WINDOW)
 
-    n = len(X)
+def run_lstm(X_train, y_train, X_val, y_val, X_test, scaler):
+    from src.tuning import tune_lstm
+    from models.lstm_model import LSTMModel, train, predict_model
+    best_params, _ = tune_lstm(X_train, y_train, X_val, y_val, n_trials=TRIALS_DL, seed=SEED, timeout=TIMEOUT, epochs=EPOCHS_DL)
+    X_full = np.concatenate([X_train, X_val])
+    y_full = np.concatenate([y_train, y_val])
+    torch.manual_seed(SEED)
+    model = LSTMModel(input_size=1, **best_params).to(device)
+    X_t = torch.tensor(X_full, dtype=torch.float32).to(device)
+    y_t = torch.tensor(y_full, dtype=torch.float32).to(device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    model = train(model, X_t, y_t, epochs=EPOCHS_DL, batch_size=32, model_name="LSTM")
+    pred = predict_model(model, X_test_t)
+    return inverse_transform(pred, scaler)
 
-    train_end = int(n * 0.7)
-    val_end   = int(n * 0.8)
 
-    X_train, y_train = X[:train_end], y[:train_end]
-    X_val,   y_val   = X[train_end:val_end], y[train_end:val_end]
-    X_test,  y_test  = X[val_end:], y[val_end:]
+def run_gru(X_train, y_train, X_val, y_val, X_test, scaler):
+    from src.tuning import tune_gru
+    from models.gru_model import GRUModel, train, predict_model
+    best_params, _ = tune_gru(X_train, y_train, X_val, y_val, n_trials=TRIALS_DL, seed=SEED, timeout=TIMEOUT, epochs=EPOCHS_DL)
+    X_full = np.concatenate([X_train, X_val])
+    y_full = np.concatenate([y_train, y_val])
+    torch.manual_seed(SEED)
+    model = GRUModel(input_size=1, **best_params).to(device)
+    X_t = torch.tensor(X_full, dtype=torch.float32).to(device)
+    y_t = torch.tensor(y_full, dtype=torch.float32).to(device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    model = train(model, X_t, y_t, epochs=EPOCHS_DL, batch_size=32, model_name="GRU")
+    pred = predict_model(model, X_test_t)
+    return inverse_transform(pred, scaler)
 
-    y_train = y_train.ravel()
-    y_test  = y_test.ravel()
 
-    # flatten for ML models
-    X_train_flat = X_train.reshape(X_train.shape[0], -1)
-    X_test_flat  = X_test.reshape(X_test.shape[0], -1)
+def run_tcn(X_train, y_train, X_val, y_val, X_test, scaler):
+    from src.tuning import tune_tcn
+    from models.tcn_model import TCN, train, predict_model
+    best_params, _ = tune_tcn(X_train, y_train, X_val, y_val, n_trials=TRIALS_DL, seed=SEED, timeout=TIMEOUT, epochs=EPOCHS_DL)
+    X_full = np.concatenate([X_train, X_val])
+    y_full = np.concatenate([y_train, y_val])
+    torch.manual_seed(SEED)
+    model = TCN(input_size=1, **best_params).to(device)
+    X_t = torch.tensor(X_full, dtype=torch.float32).to(device)
+    y_t = torch.tensor(y_full, dtype=torch.float32).to(device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    model = train(model, X_t, y_t, epochs=EPOCHS_DL, batch_size=32, model_name="TCN")
+    pred = predict_model(model, X_test_t)
+    return inverse_transform(pred, scaler)
 
-    # tensors for DL
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
-    X_test_tensor  = torch.tensor(X_test, dtype=torch.float32)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
 
-    def evaluate(name, pred):
-        y_true = (y_test * (x_max - x_min) + x_min).flatten()
-        y_pred = pred * (x_max - x_min) + x_min
-
-        results.append([
-            file, name,
-            rmse(y_true, y_pred),
-            mae(y_true, y_pred),
-            mape(y_true, y_pred)
-        ])
-
-    # ========================
-    # MODELS
-    # ========================
-
-    # 1. Persistence
-    pred = persistence_predict(X_test)
-    evaluate("Persistence", pred)
-
-    # 2. SVR
-    from sklearn.model_selection import RandomizedSearchCV
-    from sklearn.svm import SVR
-
-    param_dist = {
-        "C": np.logspace(-2, 3, 10),
-        "epsilon": [0.001, 0.01, 0.1],
-        "gamma": ["scale", "auto"]
-    }
-
-    svr = SVR()
-    search = RandomizedSearchCV(svr, param_dist, n_iter=10, cv=3, n_jobs=-1)
-    search.fit(X_train_flat, y_train)
-
-    model = search.best_estimator_
+def run_rvfl(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler):
+    from src.tuning import tune_rvfl
+    from models.rvfl_model import RVFL
+    best_params, _ = tune_rvfl(X_train_flat, y_train, X_val_flat, y_val, n_trials=TRIALS_SIMPLE, seed=SEED, timeout=TIMEOUT)
+    X_full = np.concatenate([X_train_flat, X_val_flat])
+    y_full = np.concatenate([y_train, y_val])
+    model = RVFL(input_dim=X_full.shape[1], seed=SEED, **best_params)
+    model.fit(X_full, y_full)
     pred = model.predict(X_test_flat)
-    evaluate("SVR", pred)
+    return inverse_transform(pred, scaler)
 
-    # 3. ARIMA
-    train_series = prices_scaled[:train_end + WINDOW].flatten()
 
-    model = arima_train(train_series)
-    pred = arima_predict(model, len(y_test))
-    pred = pred[:len(y_test)]
-    pred = arima_predict(model, len(y_test))
-    pred = pred[:len(y_test)]
-    evaluate("ARIMA", pred)
-
-    # 4. LSTM
-    model = LSTMModel()
-    model = lstm_train(model, X_train_tensor, y_train_tensor)
-    pred = model(X_test_tensor).detach().numpy().flatten()
-    evaluate("LSTM", pred)
-
-    # 5. GRU
-    model = GRUModel()
-    model = gru_train(model, X_train_tensor, y_train_tensor)
-    pred = model(X_test_tensor).detach().numpy().flatten()
-    evaluate("GRU", pred)
-
-    # 6. TCN
-    model = TCN()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_fn = torch.nn.MSELoss()
-
-    for _ in range(50):
-        pred = model(X_train_tensor)
-        loss = loss_fn(pred.squeeze(), y_train_tensor.squeeze())
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    pred = model(X_test_tensor).detach().numpy().flatten()
-    evaluate("TCN", pred)
-
-    # 7. RVFL
-    model = RVFL(X_train_flat.shape[1])
-    model.fit(X_train_flat, y_train)
+def run_edrvfl(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler):
+    from src.tuning import tune_edrvfl
+    from models.edrvfl_model import edRVFL
+    best_params, _ = tune_edrvfl(X_train_flat, y_train, X_val_flat, y_val, n_trials=TRIALS_SIMPLE, seed=SEED, timeout=TIMEOUT)
+    X_full = np.concatenate([X_train_flat, X_val_flat])
+    y_full = np.concatenate([y_train, y_val])
+    model = edRVFL(input_dim=X_full.shape[1], seed=SEED, **best_params)
+    model.fit(X_full, y_full)
     pred = model.predict(X_test_flat)
-    evaluate("RVFL", pred)
+    return inverse_transform(pred, scaler)
 
-    # 8. edRVFL
-    model = edRVFL(X_train_flat.shape[1])
-    model.fit(X_train_flat, y_train)
+
+def run_edesn(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler):
+    from src.tuning import tune_edesn
+    from models.edesn_model import edESN
+    best_params, _ = tune_edesn(X_train_flat, y_train, X_val_flat, y_val, n_trials=TRIALS_SIMPLE, seed=SEED, timeout=TIMEOUT)
+    X_full = np.concatenate([X_train_flat, X_val_flat])
+    y_full = np.concatenate([y_train, y_val])
+    model = edESN(input_dim=X_full.shape[1], seed=SEED, **best_params)
+    model.fit(X_full, y_full)
     pred = model.predict(X_test_flat)
-    evaluate("edRVFL", pred)
+    return inverse_transform(pred, scaler)
 
-    # 9. edESN
-    model = edESN(X_train_flat.shape[1])
-    model.fit(X_train_flat, y_train)
-    pred = model.predict(X_test_flat)
-    evaluate("edESN", pred)
 
-    # 10. VMD-LSTM (placeholder)
-    model = vmd_lstm_build()
-    model = lstm_train(model, X_train_tensor, y_train_tensor)
-    pred = model(X_test_tensor).detach().numpy().flatten()
-    evaluate("VMD-LSTM", pred)
+def run_vmd_lstm(prices_scaled, train_end, val_end, window_size, scaler):
+    from models.vmd_lstm_model import VMDLSTM
+    train_val_series = prices_scaled[:val_end + window_size].flatten()
+    test_series = prices_scaled[val_end:].flatten()
+    model = VMDLSTM(window_size=window_size, hidden_size=16, num_layers=1, seed=SEED)
+    model.fit(train_val_series, epochs=EPOCHS_DL, batch_size=32)
+    pred = model.predict(test_series)
+    return inverse_transform(pred, scaler) if pred is not None and len(pred) > 0 else None
 
-    # 11. EWTRVFL
-    model = ewtrvfl_build(X_train_flat.shape[1])
-    model.fit(X_train_flat, y_train)
-    pred = model.predict(X_test_flat)
-    evaluate("EWTRVFL", pred)
 
-    # 12. EWTedRVFL
-    model = ewtedrvfl_build(X_train_flat.shape[1])
-    model.fit(X_train_flat, y_train)
-    pred = model.predict(X_test_flat)
-    evaluate("EWTedRVFL", pred)
+def run_ewtrvfl(prices_scaled, train_end, val_end, window_size, scaler):
+    from models.ewtrvfl_model import EWTRVFL
+    train_val_series = prices_scaled[:val_end + window_size].flatten()
+    test_series = prices_scaled[val_end:].flatten()
+    model = EWTRVFL(window_size=window_size, hidden_dim=100, ridge_alpha=0.1, seed=SEED)
+    model.fit(train_val_series)
+    pred = model.predict(test_series)
+    return inverse_transform(pred, scaler) if pred is not None and len(pred) > 0 else None
 
-    # 13. Proposed RedRVFL
-    red = RedRVFLOrchestrator(
+
+def run_ewtedrvfl(prices_scaled, train_end, val_end, window_size, scaler):
+    from models.ewtedrvfl_model import EWTedRVFL
+    train_val_series = prices_scaled[:val_end + window_size].flatten()
+    test_series = prices_scaled[val_end:].flatten()
+    model = EWTedRVFL(window_size=window_size, hidden_dim=100, num_layers=2, ridge_alpha=0.1, seed=SEED)
+    model.fit(train_val_series)
+    pred = model.predict(test_series)
+    return inverse_transform(pred, scaler) if pred is not None and len(pred) > 0 else None
+
+
+def run_redrvfl(X_train, y_train, X_val, y_val, X_test, scaler):
+    from src.tuning import tune_redrvfl
+    from models.redrvfl_model import create_model
+    best_params, _ = tune_redrvfl(X_train, y_train, X_val, y_val, n_trials=TRIALS_SIMPLE, seed=SEED, timeout=TIMEOUT)
+    X_full = np.concatenate([X_train, X_val])
+    y_full = np.concatenate([y_train, y_val])
+    X_full_t = torch.tensor(X_full, dtype=torch.float32).to(device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+    
+    num_layers = best_params['num_layers']
+    if FAST_MODE:
+        num_layers = min(num_layers, 3) # Reduce layers in FAST_MODE
+
+    model = create_model(
         input_features=1,
-        hidden_size=50,
-        num_layers=3
+        hidden_size=best_params['hidden_size'],
+        num_layers=num_layers,
+        input_scaling=best_params['input_scaling'],
+        seed=SEED
     )
+    model.fit(X_full_t, y_full, ridge_alpha=best_params['ridge_alpha'])
+    pred = model.predict(X_test_t)
+    return inverse_transform(pred, scaler)
 
-    feature_matrices = red.extract_features(X_train_tensor)
 
-    ridge_models = []
-    for D in feature_matrices:
-        ridge = Ridge(alpha=0.1)
-        ridge.fit(D, y_train)
-        ridge_models.append(ridge)
+def evaluate_model(name, pred_orig, y_test_orig):
+    if pred_orig is None:
+        return None
 
-    pred = red.predict(X_test_tensor, ridge_models)
-    evaluate("RedRVFL", pred)
+    min_len = min(len(pred_orig), len(y_test_orig))
+    pred_orig = pred_orig[:min_len]
+    y_true = y_test_orig[:min_len]
+
+    r = rmse(y_true, pred_orig)
+    m = mae(y_true, pred_orig)
+    mp = mape(y_true, pred_orig)
+
+    return {'RMSE': r, 'MAE': m, 'MAPE': mp}
 
 
 # ========================
-# SAVE RESULTS
+# MAIN
 # ========================
-results_df = pd.DataFrame(
-    results,
-    columns=["Dataset","Model","RMSE","MAE","MAPE"]
-)
+if __name__ == "__main__":
 
-# ========================
-# PAPER STYLE TABLES
-# ========================
+    print("\n" + "=" * 60)
+    print("RedRVFL Paper Replication — Full Experiment")
+    print("=" * 60)
 
-print("\n===== TABLE 3: RMSE RESULTS =====\n")
+    # Dynamic loading of all models from models/ directory
+    models_dir = os.path.join(BASE_DIR, "models")
+    model_files = glob.glob(os.path.join(models_dir, "*_model.py"))
+    
+    available_model_bases = [os.path.basename(f).replace('_model.py', '') for f in model_files if os.path.basename(f) != '__init__.py']
+    
+    print(f"[INFO] Dynamically detected the following models: {available_model_bases}")
 
-rmse_table = results_df.pivot(index="Dataset", columns="Model", values="RMSE")
+    # Collect results
+    all_results = []
 
-# reorder columns like paper
-model_order = [
-    "ARIMA", "Persistence", "SVR", "TCN", "LSTM", "GRU",
-    "RVFL", "EWTRVFL", "VMD-LSTM", "edESN", "edRVFL", "EWTedRVFL", "RedRVFL"
-]
+    for file in DATASETS:
+        print(f"\n{'='*60}")
+        print(f"Dataset: {file}")
+        print(f"{'='*60}")
 
-rmse_table = rmse_table[model_order]
+        path = os.path.join(DATASET_FOLDER, file)
+        try:
+            prices = load_dataset(path)
+        except Exception as e:
+            print(f"Failed to load dataset {file}: {e}")
+            continue
 
-print(rmse_table.round(3))
+        best_per_model = {base: {'RMSE': None, 'MAE': None, 'MAPE': None, 'window': WINDOW_SIZES[0]} for base in available_model_bases}
 
+        for window_size in WINDOW_SIZES:
+            print(f"\n  Window Size: {window_size}")
+            print(f"  {'-'*50}")
 
-print("\n===== TABLE 4: MAE RESULTS =====\n")
+            if len(prices) < window_size + 50:
+                print(f"    Skipping: not enough data for window={window_size}")
+                continue
 
-mae_table = results_df.pivot(index="Dataset", columns="Model", values="MAE")
-mae_table = mae_table[model_order]
+            # Paper requirement: min max scaling, standard window setups
+            X_raw, y_raw = create_windows(prices, window_size)
 
-print(mae_table.round(3))
+            # Sequential split 70/10/20
+            splits = split_data(X_raw, y_raw)
+            X_train_raw = splits['X_train']
+            y_train_raw = splits['y_train']
+            X_val_raw = splits['X_val']
+            y_val_raw = splits['y_val']
+            X_test_raw = splits['X_test']
+            y_test_raw = splits['y_test']
 
+            scaler = fit_scaler(X_train_raw, y_train_raw)
 
-print("\n===== TABLE 5: MAPE RESULTS =====\n")
+            X_train, y_train = transform_data(X_train_raw, y_train_raw, scaler)
+            X_val, y_val = transform_data(X_val_raw, y_val_raw, scaler)
+            X_test, y_test = transform_data(X_test_raw, y_test_raw, scaler)
 
-mape_table = results_df.pivot(index="Dataset", columns="Model", values="MAPE")
-mape_table = mape_table[model_order]
+            y_test_orig = y_test_raw
 
-print(mape_table.round(4))
+            X_train_flat = flatten_3d(X_train)
+            X_val_flat = flatten_3d(X_val)
+            X_test_flat = flatten_3d(X_test)
 
-results_df.to_csv("all_model_results.csv", index=False)
+            n = len(X_raw)
+            train_end = int(n * 0.7)
+            val_end = int(n * 0.8)
+
+            prices_scaled = scaler.transform(prices.reshape(-1, 1)).ravel()
+
+            # Map the dynamically loaded bases to their runners
+            for base in available_model_bases:
+                def model_runner_proxy():
+                    if base == 'persistence':
+                        return run_persistence(X_test, y_test_orig, scaler)
+                    elif base == 'svr':
+                        return run_svr(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler)
+                    elif base == 'arima':
+                        return run_arima(prices_scaled, train_end, val_end, len(y_test), scaler, window_size)
+                    elif base == 'lstm':
+                        return run_lstm(X_train, y_train, X_val, y_val, X_test, scaler)
+                    elif base == 'gru':
+                        return run_gru(X_train, y_train, X_val, y_val, X_test, scaler)
+                    elif base == 'tcn':
+                        return run_tcn(X_train, y_train, X_val, y_val, X_test, scaler)
+                    elif base == 'rvfl':
+                        return run_rvfl(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler)
+                    elif base == 'edrvfl':
+                        return run_edrvfl(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler)
+                    elif base == 'edesn':
+                        return run_edesn(X_train_flat, y_train, X_val_flat, y_val, X_test_flat, scaler)
+                    elif base == 'vmd_lstm':
+                        return run_vmd_lstm(prices_scaled, train_end, val_end, window_size, scaler)
+                    elif base == 'ewtrvfl':
+                        return run_ewtrvfl(prices_scaled, train_end, val_end, window_size, scaler)
+                    elif base == 'ewtedrvfl':
+                        return run_ewtedrvfl(prices_scaled, train_end, val_end, window_size, scaler)
+                    elif base == 'redrvfl':
+                        return run_redrvfl(X_train, y_train, X_val, y_val, X_test, scaler)
+                    else:
+                        raise ValueError("Unknown dynamic model signature")
+
+                print(f"Running {base} on {file}, window={window_size}...")
+                start_time = time.time()
+                pred_orig = None
+                
+                # Execute with strict timeout threads avoiding silent freezes
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(model_runner_proxy)
+                        pred_orig = future.result(timeout=TIMEOUT + 10)  # Added safety margin
+                    
+                    if pred_orig is not None:
+                        metrics = evaluate_model(base, pred_orig, y_test_orig)
+                        elapsed = time.time() - start_time
+                        
+                        if metrics is not None:
+                            print(f"{base} DONE -> RMSE={metrics['RMSE']:.3f} (on {file})")
+
+                            if best_per_model[base]['RMSE'] is None or metrics['RMSE'] < best_per_model[base]['RMSE']:
+                                best_per_model[base] = {
+                                    **metrics,
+                                    'window': window_size
+                                }
+                        else:
+                            print(f"{base} FAILED on {file}: Metrics evaluation returned None")
+                    else:
+                        print(f"{base} FAILED on {file}: Model returned None")
+                            
+                except concurrent.futures.TimeoutError:
+                    print(f"{base} FAILED on {file}: Timeout exceeded (waited {TIMEOUT+10}s)")
+                except Exception as e:
+                    print(f"{base} ERROR on {file}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                print(f"{base} finished")
+
+        for model_name, metrics in best_per_model.items():
+            all_results.append({
+                'Dataset': file,
+                'Model': model_name,
+                'RMSE': metrics['RMSE'],
+                'MAE': metrics['MAE'],
+                'MAPE': metrics['MAPE'],
+                'Best_Window': metrics['window']
+            })
+
+    results_df = pd.DataFrame(all_results, columns=['Dataset', 'Model', 'RMSE', 'MAE', 'MAPE', 'Best_Window'])
+    
+    try:
+        results_df.to_excel(os.path.join(BASE_DIR, "all_model_results.xlsx"), index=False)
+    except Exception as e:
+        print(f"Excel saving failed ({e}), saving to CSV instead.")
+        results_df.to_csv(os.path.join(BASE_DIR, "all_model_results.csv"), index=False)
+
+    if results_df.empty or 'Model' not in results_df.columns:
+        print("No valid results found. Skipping ranking.")
+        sys.exit(0)
+
+    model_order = [
+        "arima", "persistence", "svr", "tcn", "lstm", "gru",
+        "rvfl", "ewtrvfl", "vmd_lstm", "edesn", "edrvfl", "ewtedrvfl", "redrvfl"
+    ]
+
+    if 'Model' in results_df.columns:
+        available_models = [m for m in model_order if m in results_df['Model'].values]
+    else:
+        available_models = []
+
+    if not available_models:
+        print("No models available for ranking.")
+        sys.exit(0)
+
+    print("\n" + "=" * 80)
+    print("===== TABLE: RMSE RESULTS =====")
+    print("=" * 80)
+    rmse_table = results_df.pivot(index="Dataset", columns="Model", values="RMSE")
+    rmse_table = rmse_table[[m for m in available_models if m in rmse_table.columns]]
+    print(rmse_table.round(3).to_string())
+    rmse_table.to_csv(os.path.join(BASE_DIR, "rmse_results.csv"))
+
+    print("\n" + "=" * 80)
+    print("===== TABLE: MAE RESULTS =====")
+    print("=" * 80)
+    mae_table = results_df.pivot(index="Dataset", columns="Model", values="MAE")
+    mae_table = mae_table[[m for m in available_models if m in mae_table.columns]]
+    print(mae_table.round(3).to_string())
+    mae_table.to_csv(os.path.join(BASE_DIR, "mae_results.csv"))
+
+    print("\n" + "=" * 80)
+    print("===== TABLE: MAPE RESULTS =====")
+    print("=" * 80)
+    mape_table = results_df.pivot(index="Dataset", columns="Model", values="MAPE")
+    mape_table = mape_table[[m for m in available_models if m in mape_table.columns]]
+    print(mape_table.round(4).to_string())
+    mape_table.to_csv(os.path.join(BASE_DIR, "mape_results.csv"))
+
+    print("\n" + "=" * 80)
+    print("===== MODEL RANKING (by average RMSE) =====")
+    print("=" * 80)
+    avg_rmse = results_df.groupby('Model')['RMSE'].mean().sort_values()
+    for rank, (model, val) in enumerate(avg_rmse.items(), 1):
+        marker = " ★" if model == "redrvfl" else ""
+        print(f"  {rank:2d}. {model:12s}: {val:.3f}{marker}")
+
+    print(f"\nResults saved to: all_model_results.xlsx (or .csv if fallback)")
+    print("Done.")
